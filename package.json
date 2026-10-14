@@ -1,6 +1,6 @@
 {
   "name": "philly-bear-telegram-bot",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "Private multi-locksmith Telegram dispatch bot with ZIP routing for Philly Bear Locksmith",

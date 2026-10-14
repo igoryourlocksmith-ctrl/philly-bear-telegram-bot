@@ -4,7 +4,7 @@ import pg from "pg";
 
 const { Pool } = pg;
 
-const BUILD_ID = "2026-10-13-telegram-v1-multilocksmith-3min";
+const BUILD_ID = "2026-10-13-telegram-v1-multilocksmith-3min-notesbutton";
 const PORT = Number(process.env.PORT || 3000);
 
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
@@ -609,6 +609,19 @@ function paymentKeyboard(assignmentId) {
   };
 }
 
+function completionNotesKeyboard(assignmentId) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "⏭ NO NOTES",
+          callback_data: `rp:${assignmentId}:skip_notes`
+        }
+      ]
+    ]
+  };
+}
+
 async function updateAssignmentMessage(
   assignment,
   text,
@@ -1027,6 +1040,111 @@ async function saveCompletionNotes(jobId, notes) {
   await pool.query(
     `UPDATE jobs SET completion_notes=$2 WHERE id=$1`,
     [jobId, notes]
+  );
+}
+
+async function finalizeCompletedJob(userId, assignment, notes, chatId) {
+  await saveCompletionNotes(
+    assignment.job_id,
+    notes
+  );
+
+  await setJobStatus(
+    assignment.job_id,
+    "COMPLETED"
+  );
+
+  await markAssignment(
+    assignment.id,
+    "COMPLETED",
+    true
+  );
+
+  const job =
+    await getJob(
+      assignment.job_id
+    );
+
+  const materials =
+    await getMaterials(
+      assignment.job_id
+    );
+
+  const materialsTotal =
+    materials.reduce(
+      (sum, item) =>
+        sum + Number(item.cost),
+      0
+    );
+
+  const finalAmount =
+    Number(
+      job.final_amount || 0
+    );
+
+  const tip =
+    Number(job.tip || 0);
+
+  const totalCollected =
+    finalAmount + tip;
+
+  const grossBeforeLabor =
+    finalAmount -
+    materialsTotal;
+
+  const materialLines =
+    materials.length
+      ? materials
+          .map(
+            (m) =>
+              `• ${escapeHtml(m.name)} — ${money(m.cost)}`
+          )
+          .join("\n")
+      : "• None";
+
+  const summary = [
+    `✅ <b>${escapeHtml(job.job_code)} — COMPLETED</b>`,
+    "",
+    `💵 <b>Final price:</b> ${money(finalAmount)}`,
+    "<b>Materials:</b>",
+    materialLines,
+    `<b>Materials total:</b> ${money(materialsTotal)}`,
+    `💳 <b>Payment:</b> ${escapeHtml(job.payment_method || "Not specified")}`,
+    `💰 <b>Tip:</b> ${money(tip)}`,
+    `<b>Total collected:</b> ${money(totalCollected)}`,
+    `<b>Gross before labor/overhead:</b> ${money(grossBeforeLabor)}`,
+    notes
+      ? `📝 <b>Completion notes:</b> ${escapeHtml(notes)}`
+      : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  reportSessions.delete(userId);
+
+  await updateAssignmentMessage(
+    assignment,
+    `${jobCard(job)}\n\n✅ <b>COMPLETED</b>`
+  );
+
+  await bot.sendMessage(
+    chatId,
+    summary,
+    { parse_mode: "HTML" }
+  );
+
+  await logEvent(
+    assignment.job_id,
+    "JOB_COMPLETED",
+    assignment.locksmith_id,
+    {
+      final_amount: finalAmount,
+      materials_total:
+        materialsTotal,
+      payment_method:
+        job.payment_method,
+      tip
+    }
   );
 }
 
@@ -1672,6 +1790,17 @@ bot.on("callback_query", async (query) => {
 
       return;
     }
+
+    if (action === "skip_notes") {
+      await finalizeCompletedJob(
+        userId,
+        assignment,
+        "",
+        query.message.chat.id
+      );
+
+      return;
+    }
   }
 });
 
@@ -1848,7 +1977,13 @@ bot.on("message", async (msg) => {
 
     await bot.sendMessage(
       msg.chat.id,
-      "Completion notes? Send a short note, or type SKIP."
+      "Completion notes? Send a short note, or tap NO NOTES.",
+      {
+        reply_markup:
+          completionNotesKeyboard(
+            assignment.id
+          )
+      }
     );
 
     return;
@@ -1860,107 +1995,11 @@ bot.on("message", async (msg) => {
         ? ""
         : text;
 
-    await saveCompletionNotes(
-      assignment.job_id,
-      notes
-    );
-
-    await setJobStatus(
-      assignment.job_id,
-      "COMPLETED"
-    );
-
-    await markAssignment(
-      assignment.id,
-      "COMPLETED",
-      true
-    );
-
-    const job =
-      await getJob(
-        assignment.job_id
-      );
-
-    const materials =
-      await getMaterials(
-        assignment.job_id
-      );
-
-    const materialsTotal =
-      materials.reduce(
-        (sum, item) =>
-          sum + Number(item.cost),
-        0
-      );
-
-    const finalAmount =
-      Number(
-        job.final_amount || 0
-      );
-
-    const tip =
-      Number(job.tip || 0);
-
-    const totalCollected =
-      finalAmount + tip;
-
-    const grossBeforeLabor =
-      finalAmount -
-      materialsTotal;
-
-    const materialLines =
-      materials.length
-        ? materials
-            .map(
-              (m) =>
-                `• ${escapeHtml(m.name)} — ${money(m.cost)}`
-            )
-            .join("\n")
-        : "• None";
-
-    const summary = [
-      `✅ <b>${escapeHtml(job.job_code)} — COMPLETED</b>`,
-      "",
-      `💵 <b>Final price:</b> ${money(finalAmount)}`,
-      "<b>Materials:</b>",
-      materialLines,
-      `<b>Materials total:</b> ${money(materialsTotal)}`,
-      `💳 <b>Payment:</b> ${escapeHtml(job.payment_method || "Not specified")}`,
-      `💰 <b>Tip:</b> ${money(tip)}`,
-      `<b>Total collected:</b> ${money(totalCollected)}`,
-      `<b>Gross before labor/overhead:</b> ${money(grossBeforeLabor)}`,
-      notes
-        ? `📝 <b>Completion notes:</b> ${escapeHtml(notes)}`
-        : ""
-    ]
-      .filter(Boolean)
-      .join("\n");
-
-    reportSessions.delete(userId);
-
-    await updateAssignmentMessage(
+    await finalizeCompletedJob(
+      userId,
       assignment,
-      `${jobCard(job)}\n\n✅ <b>COMPLETED</b>`
-    );
-
-    await bot.sendMessage(
-      msg.chat.id,
-      summary,
-      { parse_mode: "HTML" }
-    );
-
-    await logEvent(
-      assignment.job_id,
-      "JOB_COMPLETED",
-      assignment.locksmith_id,
-      {
-        final_amount: finalAmount,
-        materials_total:
-          materialsTotal,
-        payment_method:
-          job.payment_method,
-        tip
-      }
+      notes,
+      msg.chat.id
     );
 
     return;

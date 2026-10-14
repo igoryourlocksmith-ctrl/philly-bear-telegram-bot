@@ -1,6 +1,6 @@
 # Philly Bear Telegram Bot — v1 Multi-Locksmith
 
-Build ID: `2026-10-13-telegram-v1-multilocksmith-3min`
+Build ID: `2026-10-13-telegram-v1-multilocksmith-3min-notesbutton`
 
 This is the **first production architecture**, already designed for multiple locksmiths.
 
@@ -182,3 +182,14 @@ The Telegram service then handles ZIP routing automatically.
 - `job_events`
 
 The schema is created automatically at startup.
+
+
+## UX update — completion notes
+
+At the final completion-notes step, the locksmith can now tap:
+
+`⏭ NO NOTES`
+
+instead of typing `SKIP`.
+
+If a note is needed, the locksmith simply types the note as normal text.
