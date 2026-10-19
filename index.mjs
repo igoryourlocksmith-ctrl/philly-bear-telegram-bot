@@ -4,7 +4,7 @@ import pg from "pg";
 
 const { Pool } = pg;
 
-const BUILD_ID = "2026-10-13-telegram-v1-multilocksmith-3min-notesbutton";
+const BUILD_ID = "2026-10-18-telegram-v1.1-service-area-hours-tips";
 const PORT = Number(process.env.PORT || 3000);
 
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
@@ -15,6 +15,13 @@ const JOB_ACCEPT_TIMEOUT_SECONDS = Math.max(
   60,
   Number(process.env.JOB_ACCEPT_TIMEOUT_SECONDS || 180)
 );
+
+const PHILLY_TIMEZONE = "America/New_York";
+const DEFAULT_SERVICE_HOURS = {
+  standard: { start: "08:00", end: "19:00" },
+  vehicle_lockout: { start: "07:00", end: "21:00" },
+  residential_lockout: { start: "07:00", end: "21:00" }
+};
 
 if (!TELEGRAM_BOT_TOKEN) {
   console.error("Missing TELEGRAM_BOT_TOKEN");
@@ -95,6 +102,7 @@ async function initDb() {
       display_name TEXT NOT NULL,
       phone TEXT,
       active BOOLEAN NOT NULL DEFAULT TRUE,
+      timezone TEXT NOT NULL DEFAULT 'America/New_York',
       last_assigned_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -112,6 +120,28 @@ async function initDb() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS service_zip_codes (
+      zip_code VARCHAR(5) PRIMARY KEY,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      source TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS locksmith_service_hours (
+      id BIGSERIAL PRIMARY KEY,
+      locksmith_id BIGINT NOT NULL REFERENCES locksmiths(id) ON DELETE CASCADE,
+      service_category TEXT NOT NULL,
+      day_of_week SMALLINT NOT NULL CHECK(day_of_week BETWEEN 0 AND 6),
+      start_time TIME NOT NULL,
+      end_time TIME NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      UNIQUE(locksmith_id, service_category, day_of_week)
+    );
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS jobs (
       id BIGSERIAL PRIMARY KEY,
       job_code TEXT UNIQUE NOT NULL,
@@ -121,6 +151,7 @@ async function initDb() {
       customer_phone TEXT,
       language TEXT,
       service TEXT,
+      service_category TEXT NOT NULL DEFAULT 'standard',
       vehicle TEXT,
       problem TEXT,
       zip_code VARCHAR(5),
@@ -138,6 +169,7 @@ async function initDb() {
       final_amount NUMERIC(10,2),
       payment_method TEXT,
       tip NUMERIC(10,2) NOT NULL DEFAULT 0,
+      tip_method TEXT,
       completion_notes TEXT,
 
       received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -194,7 +226,379 @@ async function initDb() {
     ON job_assignments(status, expires_at);
   `);
 
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_service_zip_active
+    ON service_zip_codes(zip_code, active);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_locksmith_hours
+    ON locksmith_service_hours(locksmith_id, service_category, day_of_week, active);
+  `);
+
+  await pool.query(`
+    ALTER TABLE locksmiths
+    ADD COLUMN IF NOT EXISTS timezone TEXT NOT NULL DEFAULT 'America/New_York';
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS service_category TEXT NOT NULL DEFAULT 'standard';
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS tip_method TEXT;
+  `);
+
+  // Safe migration: existing locksmith coverage becomes the initial central service allowlist.
+  await pool.query(`
+    INSERT INTO service_zip_codes(zip_code, active, source)
+    SELECT DISTINCT zip_code, TRUE, 'seed_from_locksmith_coverage'
+    FROM locksmith_zip_coverage
+    WHERE active=TRUE
+    ON CONFLICT(zip_code) DO NOTHING;
+  `);
+
+  const locksmithRows = await pool.query(`SELECT id FROM locksmiths`);
+  for (const row of locksmithRows.rows) {
+    await ensureDefaultHours(row.id);
+  }
+
   console.log("PostgreSQL schema ready.");
+}
+
+
+function normalizeServiceCategory(value = "", service = "") {
+  const raw = `${value} ${service}`.toLowerCase();
+
+  if (
+    raw.includes("vehicle_lockout") ||
+    raw.includes("vehicle lockout") ||
+    raw.includes("car lockout") ||
+    raw.includes("auto lockout")
+  ) {
+    return "vehicle_lockout";
+  }
+
+  if (
+    raw.includes("residential_lockout") ||
+    raw.includes("residential lockout") ||
+    raw.includes("home lockout") ||
+    raw.includes("house lockout") ||
+    raw.includes("apartment lockout")
+  ) {
+    return "residential_lockout";
+  }
+
+  return "standard";
+}
+
+function phillyClock(date = new Date()) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: PHILLY_TIMEZONE,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  });
+
+  const parts = Object.fromEntries(
+    formatter
+      .formatToParts(date)
+      .filter((p) => p.type !== "literal")
+      .map((p) => [p.type, p.value])
+  );
+
+  const dayMap = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6
+  };
+
+  return {
+    dayOfWeek: dayMap[parts.weekday],
+    hhmm: `${parts.hour}:${parts.minute}`,
+    minutes: Number(parts.hour) * 60 + Number(parts.minute)
+  };
+}
+
+function timeToMinutes(value = "") {
+  const [h, m] = String(value).split(":").map(Number);
+  return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : NaN;
+}
+
+function isWithinWindow(nowMinutes, startValue, endValue) {
+  const start = timeToMinutes(startValue);
+  const end = timeToMinutes(endValue);
+
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
+
+  if (start <= end) {
+    return nowMinutes >= start && nowMinutes < end;
+  }
+
+  return nowMinutes >= start || nowMinutes < end;
+}
+
+function policyWindow(category) {
+  return DEFAULT_SERVICE_HOURS[normalizeServiceCategory(category)] ||
+    DEFAULT_SERVICE_HOURS.standard;
+}
+
+async function ensureDefaultHours(locksmithId) {
+  if (!pool) return;
+
+  for (let day = 0; day <= 6; day += 1) {
+    for (const [category, hours] of Object.entries(DEFAULT_SERVICE_HOURS)) {
+      await pool.query(
+        `
+          INSERT INTO locksmith_service_hours(
+            locksmith_id,
+            service_category,
+            day_of_week,
+            start_time,
+            end_time,
+            active
+          )
+          VALUES($1,$2,$3,$4,$5,TRUE)
+          ON CONFLICT(locksmith_id, service_category, day_of_week)
+          DO NOTHING
+        `,
+        [locksmithId, category, day, hours.start, hours.end]
+      );
+    }
+  }
+}
+
+async function isServiceZipAllowed(zipCode) {
+  const result = await pool.query(
+    `
+      SELECT 1
+      FROM service_zip_codes
+      WHERE zip_code=$1 AND active=TRUE
+      LIMIT 1
+    `,
+    [zipCode]
+  );
+
+  return Boolean(result.rows[0]);
+}
+
+async function addServiceZips(zipCodes, source = "telegram_admin") {
+  const unique = [...new Set(zipCodes.map(cleanZip).filter(Boolean))];
+
+  for (const zipCode of unique) {
+    await pool.query(
+      `
+        INSERT INTO service_zip_codes(zip_code, active, source)
+        VALUES($1,TRUE,$2)
+        ON CONFLICT(zip_code)
+        DO UPDATE SET active=TRUE, source=EXCLUDED.source
+      `,
+      [zipCode, source]
+    );
+  }
+
+  return unique;
+}
+
+async function removeServiceZips(zipCodes) {
+  const unique = [...new Set(zipCodes.map(cleanZip).filter(Boolean))];
+
+  if (!unique.length) return [];
+
+  await pool.query(
+    `DELETE FROM service_zip_codes WHERE zip_code = ANY($1::varchar[])`,
+    [unique]
+  );
+
+  return unique;
+}
+
+async function listServiceZips() {
+  const result = await pool.query(
+    `
+      SELECT zip_code
+      FROM service_zip_codes
+      WHERE active=TRUE
+      ORDER BY zip_code
+    `
+  );
+
+  return result.rows.map((row) => row.zip_code);
+}
+
+async function setHoursForAllDays(locksmithId, category, startTime, endTime) {
+  const normalized = normalizeServiceCategory(category);
+
+  for (let day = 0; day <= 6; day += 1) {
+    await pool.query(
+      `
+        INSERT INTO locksmith_service_hours(
+          locksmith_id,
+          service_category,
+          day_of_week,
+          start_time,
+          end_time,
+          active
+        )
+        VALUES($1,$2,$3,$4,$5,TRUE)
+        ON CONFLICT(locksmith_id, service_category, day_of_week)
+        DO UPDATE SET
+          start_time=EXCLUDED.start_time,
+          end_time=EXCLUDED.end_time,
+          active=TRUE
+      `,
+      [locksmithId, normalized, day, startTime, endTime]
+    );
+  }
+}
+
+async function getHoursForLocksmith(locksmithId, category, clock = phillyClock()) {
+  const normalized = normalizeServiceCategory(category);
+
+  let result = await pool.query(
+    `
+      SELECT start_time::text, end_time::text, active
+      FROM locksmith_service_hours
+      WHERE locksmith_id=$1
+        AND service_category=$2
+        AND day_of_week=$3
+      LIMIT 1
+    `,
+    [locksmithId, normalized, clock.dayOfWeek]
+  );
+
+  if (!result.rows[0] && normalized !== "standard") {
+    result = await pool.query(
+      `
+        SELECT start_time::text, end_time::text, active
+        FROM locksmith_service_hours
+        WHERE locksmith_id=$1
+          AND service_category='standard'
+          AND day_of_week=$2
+        LIMIT 1
+      `,
+      [locksmithId, clock.dayOfWeek]
+    );
+  }
+
+  return result.rows[0] || null;
+}
+
+async function locksmithOpenNow(locksmithId, category, clock = phillyClock()) {
+  const hours = await getHoursForLocksmith(locksmithId, category, clock);
+  if (!hours || hours.active !== true) return false;
+
+  return isWithinWindow(clock.minutes, hours.start_time, hours.end_time);
+}
+
+async function getEligibleLocksmithCandidates(zipCode, category, jobId = null) {
+  const params = [zipCode];
+  let exclusion = "";
+
+  if (jobId !== null && jobId !== undefined) {
+    params.push(jobId);
+    exclusion = `
+      AND NOT EXISTS (
+        SELECT 1
+        FROM job_assignments a
+        WHERE a.job_id=$2
+          AND a.locksmith_id=l.id
+      )
+    `;
+  }
+
+  const result = await pool.query(
+    `
+      SELECT
+        l.*,
+        z.priority
+      FROM locksmiths l
+      JOIN locksmith_zip_coverage z
+        ON z.locksmith_id=l.id
+      WHERE
+        l.active=TRUE
+        AND z.active=TRUE
+        AND z.zip_code=$1
+        ${exclusion}
+      ORDER BY
+        z.priority ASC,
+        l.last_assigned_at ASC NULLS FIRST,
+        l.id ASC
+    `,
+    params
+  );
+
+  const clock = phillyClock();
+  const eligible = [];
+
+  for (const locksmith of result.rows) {
+    if (await locksmithOpenNow(locksmith.id, category, clock)) {
+      eligible.push(locksmith);
+    }
+  }
+
+  return { eligible, clock };
+}
+
+async function checkAvailability(zipCode, category) {
+  const normalizedZip = cleanZip(zipCode);
+  const normalizedCategory = normalizeServiceCategory(category);
+  const window = policyWindow(normalizedCategory);
+
+  if (!normalizedZip) {
+    return {
+      ok: true,
+      allowed_zip: false,
+      can_accept_now: false,
+      reason: "invalid-zip",
+      timezone: PHILLY_TIMEZONE
+    };
+  }
+
+  const allowed = await isServiceZipAllowed(normalizedZip);
+
+  if (!allowed) {
+    return {
+      ok: true,
+      allowed_zip: false,
+      can_accept_now: false,
+      reason: "zip-not-served",
+      zip_code: normalizedZip,
+      service_category: normalizedCategory,
+      timezone: PHILLY_TIMEZONE,
+      current_policy_hours: `${window.start}-${window.end}`
+    };
+  }
+
+  const { eligible, clock } = await getEligibleLocksmithCandidates(
+    normalizedZip,
+    normalizedCategory
+  );
+
+  return {
+    ok: true,
+    allowed_zip: true,
+    can_accept_now: eligible.length > 0,
+    reason: eligible.length > 0 ? "available" : "no-available-locksmith",
+    zip_code: normalizedZip,
+    service_category: normalizedCategory,
+    timezone: PHILLY_TIMEZONE,
+    local_time: clock.hhmm,
+    current_policy_hours: `${window.start}-${window.end}`,
+    eligible_locksmith_count: eligible.length
+  };
+}
+
+function apiAuthorized(req) {
+  if (!INTERNAL_API_KEY) return false;
+  return String(req.headers.authorization || "") === `Bearer ${INTERNAL_API_KEY}`;
 }
 
 async function logEvent(jobId, eventType, locksmithId = null, details = {}) {
@@ -241,7 +645,9 @@ async function upsertLocksmith(telegramUserId, displayName) {
     [telegramUserId, displayName]
   );
 
-  return result.rows[0];
+  const locksmith = result.rows[0];
+  await ensureDefaultHours(locksmith.id);
+  return locksmith;
 }
 
 async function setLocksmithActive(telegramUserId, active) {
@@ -330,6 +736,15 @@ async function createJob(input = {}) {
     throw new Error("Valid 5-digit ZIP code is required");
   }
 
+  if (!(await isServiceZipAllowed(zipCode))) {
+    throw new Error(`ZIP ${zipCode} is outside the current service area`);
+  }
+
+  const serviceCategory = normalizeServiceCategory(
+    input.service_category || "",
+    input.service || ""
+  );
+
   const jobCode =
     input.job_code ||
     `PB-${String(Date.now()).slice(-6)}`;
@@ -338,15 +753,15 @@ async function createJob(input = {}) {
     `
       INSERT INTO jobs(
         job_code, status,
-        customer_name, customer_phone, language, service,
+        customer_name, customer_phone, language, service, service_category,
         vehicle, problem, zip_code, address, location_detail,
         estimate_min, estimate_max, requested_time, notes
       )
       VALUES(
         $1,'NEW',
-        $2,$3,$4,$5,
-        $6,$7,$8,$9,$10,
-        $11,$12,$13,$14
+        $2,$3,$4,$5,$6,
+        $7,$8,$9,$10,$11,
+        $12,$13,$14,$15
       )
       RETURNING *
     `,
@@ -356,6 +771,7 @@ async function createJob(input = {}) {
       input.customer_phone || "",
       input.language || "",
       input.service || "",
+      serviceCategory,
       input.vehicle || "",
       input.problem || "",
       zipCode,
@@ -369,7 +785,10 @@ async function createJob(input = {}) {
   );
 
   const job = result.rows[0];
-  await logEvent(job.id, "JOB_CREATED", null, input);
+  await logEvent(job.id, "JOB_CREATED", null, {
+    ...input,
+    service_category: serviceCategory
+  });
   return job;
 }
 
@@ -609,6 +1028,30 @@ function paymentKeyboard(assignmentId) {
   };
 }
 
+
+function tipMethodKeyboard(assignmentId) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "No tip",
+          callback_data: `rp:${assignmentId}:tip_none`
+        }
+      ],
+      [
+        {
+          text: "💵 Cash tip",
+          callback_data: `rp:${assignmentId}:tip_cash`
+        },
+        {
+          text: "🏦 Non-cash tip",
+          callback_data: `rp:${assignmentId}:tip_company`
+        }
+      ]
+    ]
+  };
+}
+
 function completionNotesKeyboard(assignmentId) {
   return {
     inline_keyboard: [
@@ -677,35 +1120,14 @@ async function clearCurrentAssignment(jobId, assignmentId) {
   );
 }
 
-async function chooseNextLocksmith(jobId, zipCode) {
-  const result = await pool.query(
-    `
-      SELECT
-        l.*,
-        z.priority
-      FROM locksmiths l
-      JOIN locksmith_zip_coverage z
-        ON z.locksmith_id=l.id
-      WHERE
-        l.active=TRUE
-        AND z.active=TRUE
-        AND z.zip_code=$2
-        AND NOT EXISTS (
-          SELECT 1
-          FROM job_assignments a
-          WHERE a.job_id=$1
-            AND a.locksmith_id=l.id
-        )
-      ORDER BY
-        z.priority ASC,
-        l.last_assigned_at ASC NULLS FIRST,
-        l.id ASC
-      LIMIT 1
-    `,
-    [jobId, zipCode]
+async function chooseNextLocksmith(jobId, zipCode, serviceCategory) {
+  const { eligible } = await getEligibleLocksmithCandidates(
+    zipCode,
+    serviceCategory,
+    jobId
   );
 
-  return result.rows[0] || null;
+  return eligible[0] || null;
 }
 
 async function routeJob(jobId) {
@@ -714,7 +1136,8 @@ async function routeJob(jobId) {
 
   const locksmith = await chooseNextLocksmith(
     job.id,
-    job.zip_code
+    job.zip_code,
+    job.service_category
   );
 
   if (!locksmith) {
@@ -1036,6 +1459,13 @@ async function saveTip(jobId, tip) {
   );
 }
 
+async function saveTipMethod(jobId, method) {
+  await pool.query(
+    `UPDATE jobs SET tip_method=$2 WHERE id=$1`,
+    [jobId, method]
+  );
+}
+
 async function saveCompletionNotes(jobId, notes) {
   await pool.query(
     `UPDATE jobs SET completion_notes=$2 WHERE id=$1`,
@@ -1085,8 +1515,13 @@ async function finalizeCompletedJob(userId, assignment, notes, chatId) {
   const tip =
     Number(job.tip || 0);
 
-  const totalCollected =
-    finalAmount + tip;
+  const tipMethod =
+    String(job.tip_method || "");
+
+  const companyHeldTip =
+    tipMethod === "Company"
+      ? tip
+      : 0;
 
   const grossBeforeLabor =
     finalAmount -
@@ -1110,8 +1545,9 @@ async function finalizeCompletedJob(userId, assignment, notes, chatId) {
     materialLines,
     `<b>Materials total:</b> ${money(materialsTotal)}`,
     `💳 <b>Payment:</b> ${escapeHtml(job.payment_method || "Not specified")}`,
-    `💰 <b>Tip:</b> ${money(tip)}`,
-    `<b>Total collected:</b> ${money(totalCollected)}`,
+    companyHeldTip > 0
+      ? `💰 <b>Tip owed to technician:</b> ${money(companyHeldTip)}`
+      : "",
     `<b>Gross before labor/overhead:</b> ${money(grossBeforeLabor)}`,
     notes
       ? `📝 <b>Completion notes:</b> ${escapeHtml(notes)}`
@@ -1143,7 +1579,9 @@ async function finalizeCompletedJob(userId, assignment, notes, chatId) {
         materialsTotal,
       payment_method:
         job.payment_method,
-      tip
+      tip,
+      tip_method:
+        job.tip_method
     }
   );
 }
@@ -1195,6 +1633,11 @@ bot.onText(/^\/start$/, async (msg) => {
         "/addlocksmith TELEGRAM_ID Name",
         "/addzip TELEGRAM_ID ZIP PRIORITY",
         "/removezip TELEGRAM_ID ZIP",
+        "/servicezip add ZIP [ZIP...]",
+        "/servicezip remove ZIP [ZIP...]",
+        "/servicezips",
+        "/sethours TELEGRAM_ID CATEGORY HH:MM HH:MM",
+        "/hours TELEGRAM_ID",
         "/setactive TELEGRAM_ID on|off",
         "/locksmiths",
         "/testjob ZIP",
@@ -1295,6 +1738,109 @@ bot.onText(
         `Error: ${err.message}`
       );
     }
+  }
+);
+
+
+bot.onText(
+  /^\/servicezip\s+(add|remove)\s+(.+)$/i,
+  async (msg, match) => {
+    if (!pool || !isAdmin(msg.from.id)) return;
+
+    const action = match[1].toLowerCase();
+    const zipCodes = String(match[2])
+      .split(/[\s,;]+/)
+      .map(cleanZip)
+      .filter(Boolean);
+
+    if (!zipCodes.length) {
+      await bot.sendMessage(msg.chat.id, "No valid 5-digit ZIP codes found.");
+      return;
+    }
+
+    const changed = action === "add"
+      ? await addServiceZips(zipCodes)
+      : await removeServiceZips(zipCodes);
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `${action === "add" ? "✅ Added" : "🗑 Removed"} service ZIPs: ${changed.join(", ")}`
+    );
+  }
+);
+
+bot.onText(/^\/servicezips$/i, async (msg) => {
+  if (!pool || !isAdmin(msg.from.id)) return;
+
+  const zips = await listServiceZips();
+
+  await bot.sendMessage(
+    msg.chat.id,
+    zips.length
+      ? `Service ZIP allowlist (${zips.length}):\n${zips.join(", ")}`
+      : "Service ZIP allowlist is empty."
+  );
+});
+
+bot.onText(
+  /^\/sethours\s+(\d+)\s+(standard|vehicle_lockout|residential_lockout)\s+(\d{2}:\d{2})\s+(\d{2}:\d{2})$/i,
+  async (msg, match) => {
+    if (!pool || !isAdmin(msg.from.id)) return;
+
+    const locksmith = await getLocksmithByTelegramId(match[1]);
+    if (!locksmith) {
+      await bot.sendMessage(msg.chat.id, "Locksmith not found.");
+      return;
+    }
+
+    const category = normalizeServiceCategory(match[2]);
+    const start = match[3];
+    const end = match[4];
+
+    if (!Number.isFinite(timeToMinutes(start)) || !Number.isFinite(timeToMinutes(end))) {
+      await bot.sendMessage(msg.chat.id, "Use HH:MM 24-hour time, for example 08:00 19:00.");
+      return;
+    }
+
+    await setHoursForAllDays(locksmith.id, category, start, end);
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `✅ ${locksmith.display_name}: ${category} ${start}-${end}, every day (${PHILLY_TIMEZONE}).`
+    );
+  }
+);
+
+bot.onText(
+  /^\/hours\s+(\d+)$/i,
+  async (msg, match) => {
+    if (!pool || !isAdmin(msg.from.id)) return;
+
+    const locksmith = await getLocksmithByTelegramId(match[1]);
+    if (!locksmith) {
+      await bot.sendMessage(msg.chat.id, "Locksmith not found.");
+      return;
+    }
+
+    const result = await pool.query(
+      `
+        SELECT service_category, day_of_week, start_time::text, end_time::text, active
+        FROM locksmith_service_hours
+        WHERE locksmith_id=$1
+        ORDER BY service_category, day_of_week
+      `,
+      [locksmith.id]
+    );
+
+    const day0 = result.rows.filter((row) => row.day_of_week === 0 || row.day_of_week === "0");
+    const lines = day0.map(
+      (row) => `${row.service_category}: ${String(row.start_time).slice(0,5)}-${String(row.end_time).slice(0,5)}`
+    );
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `${locksmith.display_name} hours (${PHILLY_TIMEZONE}, currently same every day):\n${lines.join("\n")}`
+    );
   }
 );
 
@@ -1451,6 +1997,7 @@ bot.onText(
       customer_phone: "+12155550147",
       language: "English",
       service: "Vehicle Lockout",
+      service_category: "vehicle_lockout",
       vehicle: "2024 Kia Seltos",
       problem: "Key locked inside vehicle",
       zip_code: zipCode,
@@ -1775,7 +2322,7 @@ bot.on("callback_query", async (query) => {
       reportSessions.set(
         userId,
         {
-          step: "tip",
+          step: "tip_method",
           assignmentId:
             String(assignment.id),
           jobId:
@@ -1785,7 +2332,70 @@ bot.on("callback_query", async (query) => {
 
       await bot.sendMessage(
         query.message.chat.id,
-        `Payment: ${method}\nTip amount? Enter 0 if no tip.`
+        `Payment: ${method}\nTip?`,
+        {
+          reply_markup:
+            tipMethodKeyboard(
+              assignment.id
+            )
+        }
+      );
+
+      return;
+    }
+
+    if (action === "tip_none") {
+      await saveTip(assignment.job_id, 0);
+      await saveTipMethod(assignment.job_id, "None");
+
+      reportSessions.set(
+        userId,
+        {
+          step: "notes",
+          assignmentId:
+            String(assignment.id),
+          jobId:
+            String(assignment.job_id)
+        }
+      );
+
+      await bot.sendMessage(
+        query.message.chat.id,
+        "Completion notes? Send a short note, or tap NO NOTES.",
+        {
+          reply_markup:
+            completionNotesKeyboard(
+              assignment.id
+            )
+        }
+      );
+
+      return;
+    }
+
+    if (action === "tip_cash" || action === "tip_company") {
+      const tipMethod =
+        action === "tip_cash"
+          ? "Cash"
+          : "Company";
+
+      reportSessions.set(
+        userId,
+        {
+          step: "tip_amount",
+          tipMethod,
+          assignmentId:
+            String(assignment.id),
+          jobId:
+            String(assignment.job_id)
+        }
+      );
+
+      await bot.sendMessage(
+        query.message.chat.id,
+        tipMethod === "Cash"
+          ? "Cash tip amount?"
+          : "Non-cash tip amount? This amount will be owed 100% to the technician."
       );
 
       return;
@@ -1950,7 +2560,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  if (session.step === "tip") {
+  if (session.step === "tip_amount") {
     const tip =
       parseAmount(text);
 
@@ -1965,6 +2575,11 @@ bot.on("message", async (msg) => {
     await saveTip(
       assignment.job_id,
       tip
+    );
+
+    await saveTipMethod(
+      assignment.job_id,
+      session.tipMethod || "None"
     );
 
     reportSessions.set(
@@ -2028,9 +2643,40 @@ app.get("/health", (_req, res) => {
       Boolean(ADMIN_TELEGRAM_ID),
     apiConfigured:
       Boolean(INTERNAL_API_KEY),
+    serviceAreaAllowlist: true,
+    perLocksmithHours: true,
+    timezone: PHILLY_TIMEZONE,
     acceptTimeoutSeconds:
       JOB_ACCEPT_TIMEOUT_SECONDS
   });
+});
+
+
+app.post("/api/availability/check", async (req, res) => {
+  if (requireDb(res)) return;
+
+  if (!apiAuthorized(req)) {
+    res.status(401).json({
+      ok: false,
+      error: "Unauthorized"
+    });
+    return;
+  }
+
+  try {
+    const result = await checkAvailability(
+      req.body?.zip_code || "",
+      req.body?.service_category || req.body?.service || "standard"
+    );
+
+    res.json(result);
+  } catch (err) {
+    console.error("/api/availability/check:", err);
+    res.status(500).json({
+      ok: false,
+      error: "Availability check failed"
+    });
+  }
 });
 
 app.post("/api/jobs", async (req, res) => {
@@ -2045,16 +2691,7 @@ app.post("/api/jobs", async (req, res) => {
     return;
   }
 
-  const auth =
-    String(
-      req.headers.authorization ||
-        ""
-    );
-
-  if (
-    auth !==
-    `Bearer ${INTERNAL_API_KEY}`
-  ) {
+  if (!apiAuthorized(req)) {
     res.status(401).json({
       ok: false,
       error: "Unauthorized"
@@ -2063,6 +2700,29 @@ app.post("/api/jobs", async (req, res) => {
   }
 
   try {
+    const availability = await checkAvailability(
+      req.body?.zip_code || "",
+      req.body?.service_category || req.body?.service || "standard"
+    );
+
+    if (!availability.allowed_zip) {
+      res.status(422).json({
+        ok: false,
+        error: "ZIP is outside the service area",
+        availability
+      });
+      return;
+    }
+
+    if (!availability.can_accept_now) {
+      res.status(409).json({
+        ok: false,
+        error: "No eligible locksmith is available now",
+        availability
+      });
+      return;
+    }
+
     const job =
       await createJob(
         req.body || {}

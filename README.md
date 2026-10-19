@@ -1,195 +1,87 @@
-# Philly Bear Telegram Bot — v1 Multi-Locksmith
+# Philly Bear Telegram Bot — v1.1
 
-Build ID: `2026-10-13-telegram-v1-multilocksmith-3min-notesbutton`
+Build ID: `2026-10-18-telegram-v1.1-service-area-hours-tips`
+Package version: `1.1.0`
 
-This is the **first production architecture**, already designed for multiple locksmiths.
+## New central service ZIP allowlist
 
-## Core privacy rule
+A new PostgreSQL table `service_zip_codes` controls where Philly Bear accepts jobs.
 
-There is **no shared job channel**.
+On the first start of v1.1, all existing active ZIPs from `locksmith_zip_coverage`
+are automatically copied into the service allowlist. This prevents the upgrade from
+suddenly blocking the ZIPs you already use.
 
-A new job is first routed by ZIP code. Only after assignment does the bot send the job card to **one locksmith's private Telegram chat**.
+Admin commands:
+- `/servicezip add 19147 19148 19145`
+- `/servicezip remove 19145`
+- `/servicezips`
 
-Other locksmiths:
-- do not receive the card;
-- cannot see it in `/myjobs`;
-- cannot use its buttons;
-- cannot access the assignment by guessing a callback.
+The allowlist is separate from each locksmith's personal ZIP coverage.
 
-Every callback re-checks:
-1. the current assignment;
-2. the Telegram User ID;
-3. that the assignment is still active.
+## Per-locksmith schedules
 
-## ZIP routing
+A new table `locksmith_service_hours` stores schedules by locksmith, service category,
+and day of week.
 
-Each locksmith has exact 5-digit ZIP coverage and a priority.
+Existing and newly added locksmiths receive default daily hours:
+- `standard`: 08:00–19:00
+- `vehicle_lockout`: 07:00–21:00
+- `residential_lockout`: 07:00–21:00
 
-Example:
+Timezone: `America/New_York`.
 
-- Igor: 19147 priority 10
-- Alex: 19147 priority 20
-- Alex: 19148 priority 10
+Admin commands:
+- `/sethours TELEGRAM_ID standard 08:00 19:00`
+- `/sethours TELEGRAM_ID vehicle_lockout 07:00 21:00`
+- `/sethours TELEGRAM_ID residential_lockout 07:00 21:00`
+- `/hours TELEGRAM_ID`
 
-For a 19147 job:
-1. Igor receives the card first.
-2. If Igor declines or does not accept before timeout, his card becomes expired/reassigned.
-3. Alex receives the job next.
-4. No other locksmith sees it.
+The database schema already supports different schedules for different days; the current
+admin command applies the chosen hours to all seven days.
 
-Within equal priority, the bot prefers the locksmith who has gone longest without receiving an assignment.
+## Routing
 
-## Job flow
+A locksmith is eligible only if all are true:
+1. ZIP is in the central service allowlist.
+2. Locksmith is active.
+3. ZIP is in that locksmith's personal coverage.
+4. Locksmith is currently inside their schedule for the service category.
+5. Locksmith has not already declined/timed out on that job.
 
-`NEW → OFFERED → ACCEPTED → EN_ROUTE → ARRIVED → REPORTING → COMPLETED`
+Priority and the existing 3-minute acceptance timeout remain unchanged.
 
-Alternate outcomes:
-- `DECLINED`
-- `TIMEOUT`
-- `CANCELLED`
-- `UNASSIGNED`
+## Availability API
 
-## Completion report
+New protected endpoint:
+`POST /api/availability/check`
 
-The assigned locksmith records:
-- final customer price;
-- one or more materials / parts;
-- actual material cost;
-- payment method;
-- tip;
-- completion notes.
+It checks ZIP + service category before the voice dispatcher asks for the full address.
 
-The bot calculates:
-- materials total;
-- total collected;
-- gross before labor / overhead.
+## Tip accounting change
 
-## Railway variables
+Tip method is now recorded separately:
+- No tip
+- Cash tip
+- Non-cash tip
 
-Required:
+Cash tips:
+- are stored internally;
+- are NOT shown in the completed-job financial report;
+- are NOT added to the amount owed to the technician, because the technician already has the cash.
 
+Non-cash tips:
+- are stored separately;
+- appear as `Tip owed to technician`;
+- are intended to be paid to the technician 100%;
+- do not increase `Gross before labor/overhead`.
+
+The final report no longer mixes tips into gross profit.
+
+## Existing Railway variables
+
+Keep:
 - `TELEGRAM_BOT_TOKEN`
 - `DATABASE_URL`
-
-Admin:
-
 - `ADMIN_TELEGRAM_ID`
-
-Security for future AI integration:
-
 - `INTERNAL_API_KEY`
-
-Optional:
-
-- `JOB_ACCEPT_TIMEOUT_SECONDS`
-  - default: `180` seconds / 3 minutes
-  - minimum: 60 seconds
-
-## Locksmith onboarding
-
-Every locksmith must first open `@PhillyBearDispatcherBot` and send:
-
-`/myid`
-
-They send the numeric Telegram User ID to the administrator.
-
-Admin then runs:
-
-`/addlocksmith TELEGRAM_ID Name`
-
-Example:
-
-`/addlocksmith 123456789 Alex`
-
-Assign ZIP coverage:
-
-`/addzip TELEGRAM_ID ZIP PRIORITY`
-
-Example:
-
-`/addzip 123456789 19147 10`
-
-A lower number means higher priority.
-
-Deactivate a locksmith temporarily:
-
-`/setactive TELEGRAM_ID off`
-
-Reactivate:
-
-`/setactive TELEGRAM_ID on`
-
-List all locksmiths and coverage:
-
-`/locksmiths`
-
-## Locksmith commands
-
-- `/start`
-- `/myid`
-- `/mycoverage`
-- `/myjobs`
-
-A locksmith sees only jobs currently assigned to that locksmith.
-
-## Test routing
-
-Admin can create a test order:
-
-`/testjob 19147`
-
-The card goes only to the highest-priority active locksmith covering `19147`.
-
-## Future AI integration
-
-The voice dispatcher will create jobs through:
-
-`POST /api/jobs`
-
-Authorization:
-
-`Authorization: Bearer <INTERNAL_API_KEY>`
-
-Example body:
-
-```json
-{
-  "customer_name": "John Smith",
-  "customer_phone": "+12155550123",
-  "language": "English",
-  "service": "Vehicle Lockout",
-  "vehicle": "2024 Kia Seltos",
-  "problem": "Key locked inside vehicle",
-  "zip_code": "19147",
-  "address": "2040 S 13th St, Philadelphia, PA 19148",
-  "location_detail": "Vehicle on street",
-  "estimate_min": 120,
-  "estimate_max": 160,
-  "requested_time": "ASAP",
-  "notes": "Customer can see the key inside."
-}
-```
-
-The Telegram service then handles ZIP routing automatically.
-
-## Database tables
-
-- `locksmiths`
-- `locksmith_zip_coverage`
-- `jobs`
-- `job_assignments`
-- `materials`
-- `job_events`
-
-The schema is created automatically at startup.
-
-
-## UX update — completion notes
-
-At the final completion-notes step, the locksmith can now tap:
-
-`⏭ NO NOTES`
-
-instead of typing `SKIP`.
-
-If a note is needed, the locksmith simply types the note as normal text.
+- `JOB_ACCEPT_TIMEOUT_SECONDS` (optional; default remains 180 seconds)
